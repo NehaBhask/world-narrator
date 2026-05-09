@@ -30,15 +30,26 @@ Future<void> main() async {
     cameras = await availableCameras();
   } catch (_) {}
 
-  // Initialise singletons
+  // Initialise singletons — non-blocking on model failures
   await DpdpConsentManager.instance.init();
   await ModelManager.instance.init();
   await TtsService.instance.init();
   await HapticService.instance.init();
   await ConnectivityService.instance.init();
   await LanguageService.instance.init();
-  await SttManager.instance.init();
-  await WakeWordEngine.instance.init();
+  
+  // Pipeline services can fail gracefully
+  try {
+    await SttManager.instance.init();
+  } catch (e) {
+    debugPrint('STT init failed (non-fatal): $e');
+  }
+  
+  try {
+    await WakeWordEngine.instance.init();
+  } catch (e) {
+    debugPrint('Wake word engine init failed (non-fatal): $e');
+  }
 
   runApp(const NarratorApp());
 }

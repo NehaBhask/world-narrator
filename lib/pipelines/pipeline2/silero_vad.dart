@@ -18,9 +18,12 @@ class SileroVad {
   final _log = Logger();
   OrtSession? _session;
 
-  // Silero VAD stateful tensors
-  List<List<List<double>>> _h = List.generate(2, (_) => List.generate(64, (_) => List.filled(128, 0.0)));
-  List<List<List<double>>> _c = List.generate(2, (_) => List.generate(64, (_) => List.filled(128, 0.0)));
+  // Silero VAD stateful LSTM tensors — shape [2, 1, 64]
+  // Must be updated after every inference window or VAD degrades immediately.
+  List<List<List<double>>> _h =
+      List.generate(2, (_) => List.generate(1, (_) => List.filled(64, 0.0)));
+  List<List<List<double>>> _c =
+      List.generate(2, (_) => List.generate(1, (_) => List.filled(64, 0.0)));
 
   static const int _sampleRate = 16000;
   static const int _windowSizeSamples = 512; // 32ms @ 16kHz
@@ -35,29 +38,43 @@ class SileroVad {
   final _speechEndController = StreamController<Uint8List>.broadcast();
   Stream<Uint8List> get onSpeechEnd => _speechEndController.stream;
 
-  final List<int> _audioBuffer = []; // accumulated PCM int16
+  // Accumulates PCM int16 samples across chunks for speech-end emission
+  final List<int> _audioBuffer = [];
+
+  bool _isLoaded = false;
+  bool get isLoaded => _isLoaded;
 
   Future<void> init() async {
-    OrtEnv.instance.init();
-    final modelPath = ModelManager.instance.modelPath(AppConstants.sileroVadFile);
-    final sessionOptions = OrtSessionOptions()
-      ..setInterOpNumThreads(1)
-      ..setIntraOpNumThreads(1);
-    _session = await OrtSession.fromFile(File(modelPath), sessionOptions);
-    _log.i('Silero VAD loaded');
+    final modelPath =
+        ModelManager.instance.modelPath(AppConstants.sileroVadFile);
+    if (!File(modelPath).existsSync()) {
+      _log.w('Silero VAD model not found — VAD disabled. Download it first.');
+      return;
+    }
+    try {
+      OrtEnv.instance.init();
+      final sessionOptions = OrtSessionOptions()
+        ..setInterOpNumThreads(1)
+        ..setIntraOpNumThreads(1);
+      _session = await OrtSession.fromFile(File(modelPath), sessionOptions);
+      _isLoaded = true;
+      _log.i('Silero VAD loaded');
+    } catch (e) {
+      _log.e('Silero VAD init failed: $e');
+    }
   }
 
   /// Feed 16kHz int16 PCM chunk. Internally windows into 512-sample frames.
   Future<void> feed(Uint8List pcm16leBytes) async {
     if (_session == null) return;
 
-    // Convert bytes to int16 samples
+    // Convert bytes → int16 samples and append to buffer
     final bd = ByteData.sublistView(pcm16leBytes);
     for (int i = 0; i < pcm16leBytes.length - 1; i += 2) {
       _audioBuffer.add(bd.getInt16(i, Endian.little));
     }
 
-    // Process complete windows
+    // Process complete 512-sample windows
     while (_audioBuffer.length >= _windowSizeSamples) {
       final window = _audioBuffer.sublist(0, _windowSizeSamples);
       _audioBuffer.removeRange(0, _windowSizeSamples);
@@ -66,11 +83,12 @@ class SileroVad {
   }
 
   Future<void> _processWindow(List<int> samples) async {
-    // Normalise to float [-1, 1]
-    final floats = Float32List.fromList(
-        samples.map((s) => s / 32768.0).toList());
+    // Normalise int16 → float32 [-1, 1]
+    final floats =
+        Float32List.fromList(samples.map((s) => s / 32768.0).toList());
 
-    // Build ONNX inputs
+    // Build ONNX input tensors
+    // input: [1, 512], sr: [1], h: [2, 1, 64], c: [2, 1, 64]
     final inputTensor = OrtValueTensor.createTensorWithDataList(
         floats, [1, _windowSizeSamples]);
     final srTensor = OrtValueTensor.createTensorWithDataList(
@@ -88,16 +106,29 @@ class SileroVad {
     };
 
     final outputs = await _session!.runAsync(
-      OrtRunOptions(), inputs,
+      OrtRunOptions(),
+      inputs,
       ['output', 'hn', 'cn'],
     );
 
-    final outputList = outputs!;
-    final prob = (outputList[0]?.value as List<dynamic>)[0][0] as double;
-    final hn = outputList[1]?.value as List<dynamic>;
-    final cn = outputList[2]?.value as List<dynamic>;
+    if (outputs == null) {
+      for (final v in inputs.values) v.release();
+      return;
+    }
+
+    // Extract values BEFORE releasing tensors
+    final prob = (outputs[0]?.value as List<dynamic>)[0][0] as double;
+    final hn = outputs[1]?.value as List<dynamic>;
+    final cn = outputs[2]?.value as List<dynamic>;
+
+    // ✅ Update LSTM state before release — this was the bug:
+    // previously _updateState was never called, so h/c stayed all-zeros
+    // and the model gave meaningless probabilities after the first frame.
+    _updateState(hn, cn);
+
+    // Now safe to release
     for (final v in inputs.values) v.release();
-    for (final o in outputList) o?.release();
+    for (final o in outputs) o?.release();
 
     _onProbability(prob);
   }
@@ -117,6 +148,7 @@ class SileroVad {
   }
 
   void _emitSpeechEnd() {
+    // Emit whatever remains in the buffer as the final audio chunk
     final pcm = Uint8List(_audioBuffer.length * 2);
     final bd = ByteData.sublistView(pcm);
     for (int i = 0; i < _audioBuffer.length; i++) {
@@ -137,21 +169,22 @@ class SileroVad {
     return Float32List.fromList(flat);
   }
 
+  /// Unpack new h/c LSTM states from ONNX output (shape [2, 1, 64])
+  /// and store them for the next inference window.
   void _updateState(List<dynamic> hn, List<dynamic> cn) {
-    // Unpack new h, c states (shape [2, 1, 64])
     for (int i = 0; i < 2; i++) {
       for (int j = 0; j < 64; j++) {
-        _h[i][j] = List<double>.from(
-            (hn[i][0][j] as List).map((e) => (e as num).toDouble()));
-        _c[i][j] = List<double>.from(
-            (cn[i][0][j] as List).map((e) => (e as num).toDouble()));
+        _h[i][0][j] = (hn[i][0][j] as num).toDouble();
+        _c[i][0][j] = (cn[i][0][j] as num).toDouble();
       }
     }
   }
 
   void reset() {
-    _h = List.generate(2, (_) => List.generate(64, (_) => List.filled(128, 0.0)));
-    _c = List.generate(2, (_) => List.generate(64, (_) => List.filled(128, 0.0)));
+    _h = List.generate(
+        2, (_) => List.generate(1, (_) => List.filled(64, 0.0)));
+    _c = List.generate(
+        2, (_) => List.generate(1, (_) => List.filled(64, 0.0)));
     _isSpeaking = false;
     _silenceFrameCount = 0;
     _audioBuffer.clear();

@@ -63,12 +63,20 @@ class ModelManager {
       estimatedSizeMb: 2,
       description: 'Voice activity detection',
     ),
+    // Whisper-tiny is two files: encoder + merged decoder
     ModelInfo(
-      name: 'Whisper-tiny Multilingual',
-      fileName: AppConstants.whisperTinyFile,
-      url: AppConstants.whisperTinyOnnxUrl,
-      estimatedSizeMb: 75,
-      description: 'Offline speech-to-text (all Indian languages)',
+      name: 'Whisper-tiny Encoder',
+      fileName: AppConstants.whisperTinyEncoderFile,
+      url: AppConstants.whisperTinyEncoderUrl,
+      estimatedSizeMb: 33,
+      description: 'Offline STT encoder (all Indian languages)',
+    ),
+    ModelInfo(
+      name: 'Whisper-tiny Decoder',
+      fileName: AppConstants.whisperTinyDecoderFile,
+      url: AppConstants.whisperTinyDecoderUrl,
+      estimatedSizeMb: 119,
+      description: 'Offline STT merged decoder (all Indian languages)',
     ),
     ModelInfo(
       name: 'IndicTrans2 INT8',
@@ -78,10 +86,17 @@ class ModelManager {
       description: 'Indian language → English translation',
     ),
     ModelInfo(
-      name: 'SmolVLM-256M',
+      name: 'SmolVLM-256M (Vision Projector)',
       fileName: AppConstants.smolvlmFile,
       url: AppConstants.smolvlmGgufUrl,
-      estimatedSizeMb: 500,
+      estimatedSizeMb: 190,
+      description: 'Vision-language model projector',
+    ),
+    ModelInfo(
+      name: 'SmolVLM-256M (Language Model)',
+      fileName: AppConstants.smolvlmTextFile,
+      url: AppConstants.smolvlmTextGgufUrl,
+      estimatedSizeMb: 125,
       description: 'Vision-language model (scene description)',
     ),
   ];
@@ -121,61 +136,114 @@ class ModelManager {
       isReady(AppConstants.yolov8nBinFile) &&
       isReady(AppConstants.sileroVadFile);
 
+  // Both whisper files must be present for offline STT to work
   bool get pipeline2Ready =>
       coreModelsReady &&
-      isReady(AppConstants.whisperTinyFile) &&
-      isReady(AppConstants.smolvlmFile);
+      isReady(AppConstants.whisperTinyEncoderFile) &&
+      isReady(AppConstants.whisperTinyDecoderFile) &&
+      isReady(AppConstants.smolvlmFile) &&
+      isReady(AppConstants.smolvlmTextFile);
 
-  Future<bool> downloadModel(ModelInfo model) async {
+  Future<bool> downloadModel(ModelInfo model, {int retries = 3}) async {
+    // Skip models that require manual download (empty URL)
+    if (model.url.isEmpty) {
+      model.status = ModelStatus.notDownloaded;
+      model.progress = 0.0;
+      return false; // Silently skip
+    }
+
     final destFile = File('${_modelDir.path}/${model.fileName}');
     final tempFile = File('${_modelDir.path}/${model.fileName}.tmp');
 
+    // ── Resumable download: check if partial download exists ──
+    int startBytes = 0;
+    if (await tempFile.exists()) {
+      startBytes = await tempFile.length();
+      _log.i('Resuming ${model.fileName} from byte $startBytes');
+    }
+
     model.status = ModelStatus.downloading;
-    model.progress = 0.0;
+    model.progress = startBytes > 0 ? (startBytes / (model.estimatedSizeMb * 1024 * 1024)) : 0.0;
     onStatusChanged?.call(model.fileName, model.status);
 
-    try {
-      await _dio.download(
-        model.url,
-        tempFile.path,
-        onReceiveProgress: (received, total) {
-          if (total > 0) {
-            model.progress = received / total;
-            onProgress?.call(model.fileName, model.progress);
-          }
-        },
-        options: Options(receiveTimeout: const Duration(minutes: 30)),
-      );
+    for (int attempt = 1; attempt <= retries; attempt++) {
+      try {
+        final dio = Dio();
 
-      // Move temp → final
-      await tempFile.rename(destFile.path);
+        // ── Set resume headers if partial download exists ──
+        final headers = startBytes > 0
+            ? {'Range': 'bytes=$startBytes-'}
+            : <String, String>{};
 
-      model.status = ModelStatus.ready;
-      model.progress = 1.0;
-      onStatusChanged?.call(model.fileName, model.status);
-      _log.i('Downloaded ${model.fileName}');
-      return true;
-    } catch (e) {
-      _log.e('Failed to download ${model.fileName}: $e');
-      if (await tempFile.exists()) await tempFile.delete();
-      model.status = ModelStatus.notDownloaded;
-      model.progress = 0.0;
-      onStatusChanged?.call(model.fileName, model.status);
-      return false;
+        await dio.download(
+          model.url,
+          tempFile.path,
+          onReceiveProgress: (received, total) {
+            if (total > 0) {
+              model.progress = (startBytes + received) / total;
+              onProgress?.call(model.fileName, model.progress);
+            }
+          },
+          options: Options(
+            receiveTimeout: const Duration(minutes: 30),
+            headers: headers,
+          ),
+        );
+
+        // Move temp → final
+        await tempFile.rename(destFile.path);
+
+        model.status = ModelStatus.ready;
+        model.progress = 1.0;
+        onStatusChanged?.call(model.fileName, model.status);
+        _log.i('Downloaded ${model.fileName}');
+        return true;
+      } catch (e) {
+        _log.e('Download attempt $attempt/$retries failed for ${model.fileName}: $e');
+        if (attempt < retries) {
+          await Future.delayed(Duration(seconds: 2 * attempt)); // exponential backoff
+          startBytes = await tempFile.exists() ? await tempFile.length() : 0;
+        }
+      }
     }
+
+    // ── All retries failed ──
+    if (await tempFile.exists()) await tempFile.delete();
+    model.status = ModelStatus.notDownloaded;
+    model.progress = 0.0;
+    onStatusChanged?.call(model.fileName, model.status);
+    return false;
   }
 
-  Future<void> downloadAll() async {
+  Future<void> downloadAll({bool allowPartial = true}) async {
     for (final model in models) {
+      if (model.url.isEmpty) {
+        // Skip models without URLs (like YOLO, IndicTrans2)
+        model.status = ModelStatus.notDownloaded;
+        continue;
+      }
       if (model.status != ModelStatus.ready) {
-        await downloadModel(model);
+        final success = await downloadModel(model);
+        if (!success && !allowPartial) {
+          throw Exception('Failed to download required model: ${model.fileName}');
+        }
       }
     }
   }
 
+  /// Graceful degradation: starts pipelines with available models
+  bool get essentialModelsReady =>
+      isReady(AppConstants.sileroVadFile); // Only VAD is truly essential
+
+  /// Optional: only needed for real-time obstacle detection
+  bool get pipeline1Ready =>
+      isReady(AppConstants.yolov8nParamFile) &&
+      isReady(AppConstants.yolov8nBinFile);
+
   Future<bool> verifyIntegrity(String fileName) async {
     final expectedHash = AppConstants.modelHashes[fileName];
-    if (expectedHash == null || expectedHash.startsWith('placeholder')) {
+    if (expectedHash == null || expectedHash.startsWith('placeholder') ||
+        expectedHash == 'verify_after_download') {
       return true; // skip verification for placeholder hashes
     }
     final file = File(modelPath(fileName));

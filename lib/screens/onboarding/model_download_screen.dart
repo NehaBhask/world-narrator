@@ -165,11 +165,14 @@ class _ModelTile extends StatelessWidget {
   final ModelInfo model;
   const _ModelTile({required this.model});
 
+  bool get _isManual => model.url.isEmpty;
+
   @override
   Widget build(BuildContext context) {
     final isReady = model.status == ModelStatus.ready;
     final isDownloading = model.status == ModelStatus.downloading;
-    final color = isReady ? const Color(0xFF00D4AA) : const Color(0xFF6C63FF);
+    final autoColor = isReady ? const Color(0xFF00D4AA) : const Color(0xFF6C63FF);
+    final manualColor = const Color(0xFFFFAA00);
 
     return Container(
       padding: const EdgeInsets.all(14),
@@ -177,35 +180,92 @@ class _ModelTile extends StatelessWidget {
         color: const Color(0xFF1A1A2E),
         borderRadius: BorderRadius.circular(14),
         border: Border.all(
-          color: isReady ? const Color(0xFF00D4AA).withOpacity(0.3) : Colors.white10),
+          color: isReady
+              ? const Color(0xFF00D4AA).withOpacity(0.3)
+              : _isManual
+                  ? manualColor.withOpacity(0.2)
+                  : Colors.white10,
+        ),
       ),
       child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
         Row(children: [
           Icon(
-            isReady ? Icons.check_circle_rounded : Icons.cloud_download_outlined,
-            color: isReady ? const Color(0xFF00D4AA) : Colors.white38, size: 20),
+            isReady
+                ? Icons.check_circle_rounded
+                : _isManual
+                    ? Icons.build_outlined
+                    : Icons.cloud_download_outlined,
+            color: isReady
+                ? const Color(0xFF00D4AA)
+                : _isManual
+                    ? manualColor
+                    : Colors.white38,
+            size: 20,
+          ),
           const Gap(10),
           Expanded(
             child: Text(model.name,
-              style: const TextStyle(color: Colors.white, fontWeight: FontWeight.w600, fontSize: 14)),
+              style: const TextStyle(
+                color: Colors.white, fontWeight: FontWeight.w600, fontSize: 14)),
           ),
-          Text('~${model.estimatedSizeMb}MB',
-            style: const TextStyle(color: Colors.white38, fontSize: 12)),
+          // Badge: Manual or size
+          Container(
+            padding: const EdgeInsets.symmetric(horizontal: 7, vertical: 2),
+            decoration: BoxDecoration(
+              color: _isManual
+                  ? manualColor.withOpacity(0.15)
+                  : Colors.white.withOpacity(0.06),
+              borderRadius: BorderRadius.circular(6),
+            ),
+            child: Text(
+              _isManual ? 'Manual' : '~${model.estimatedSizeMb}MB',
+              style: TextStyle(
+                color: _isManual ? manualColor : Colors.white38,
+                fontSize: 11,
+                fontWeight: _isManual ? FontWeight.bold : FontWeight.normal,
+              ),
+            ),
+          ),
         ]),
         const Gap(4),
         Text(model.description,
           style: const TextStyle(color: Colors.white54, fontSize: 12)),
+
+        // Manual download instruction
+        if (_isManual && !isReady) ...[
+          const Gap(8),
+          Container(
+            padding: const EdgeInsets.all(10),
+            decoration: BoxDecoration(
+              color: manualColor.withOpacity(0.08),
+              borderRadius: BorderRadius.circular(8),
+              border: Border.all(color: manualColor.withOpacity(0.2)),
+            ),
+            child: Row(children: [
+              Icon(Icons.info_outline, color: manualColor, size: 14),
+              const Gap(8),
+              Expanded(
+                child: Text(
+                  'Download manually — see README for link & ADB push command.',
+                  style: TextStyle(color: manualColor, fontSize: 11, height: 1.4),
+                ),
+              ),
+            ]),
+          ),
+        ],
+
+        // Progress bar for downloading
         if (isDownloading) ...[
           const Gap(8),
           LinearProgressIndicator(
             value: model.progress,
             backgroundColor: Colors.white10,
-            color: color,
+            color: autoColor,
             borderRadius: BorderRadius.circular(4),
           ),
           const Gap(4),
           Text('${(model.progress * 100).toInt()}%',
-            style: TextStyle(color: color, fontSize: 11)),
+            style: TextStyle(color: autoColor, fontSize: 11)),
         ],
       ]),
     );

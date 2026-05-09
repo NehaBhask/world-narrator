@@ -20,37 +20,72 @@ class AppConstants {
   static const String modelDirName = 'narrator_models';
   static const String sileroVadAsset = 'assets/models/silero_vad.onnx';
 
-  // Remote model URLs (HuggingFace / CDN)
-  static const String yolov8nParamUrl =
-      'https://huggingface.co/spaces/narrator-app/models/resolve/main/yolov8n.ncnn.param';
-  static const String yolov8nBinUrl =
-      'https://huggingface.co/spaces/narrator-app/models/resolve/main/yolov8n.ncnn.bin';
+  // ── Remote Model URLs ───────────────────────────────────
+
+  // YOLOv8-nano: convert with `yolo export model=yolov8n.pt format=ncnn`,
+  // then self-host the .param and .bin files.
+  static const String yolov8nParamUrl = ''; // TODO: self-host after NCNN export
+  static const String yolov8nBinUrl = '';   // TODO: self-host after NCNN export
+
+  // SmolVLM-256M vision projector (mmproj, 190 MB) — unchanged, correct.
   static const String smolvlmGgufUrl =
-      'https://huggingface.co/HuggingFaceTB/SmolVLM-256M-Instruct-GGUF/resolve/main/SmolVLM-256M-Instruct-Q4_K_M.gguf';
-  static const String indicTrans2OnnxUrl =
-      'https://huggingface.co/spaces/narrator-app/models/resolve/main/indictrans2_int8.onnx';
-  static const String whisperTinyOnnxUrl =
-      'https://huggingface.co/spaces/narrator-app/models/resolve/main/whisper_tiny_multilingual.onnx';
+      'https://huggingface.co/ggml-org/SmolVLM-256M-Instruct-GGUF/resolve/main/mmproj-SmolVLM-256M-Instruct-f16.gguf';
+
+  // SmolVLM-256M language model (Q4_K_M, 125 MB).
+  // FIX: ggml-org repo only has Q8_0 and F16 — no Q4_K_M there.
+  // mradermacher's repo has the Q4_K_M quant (note the dot before Q4, not
+  // a hyphen: SmolVLM-256M-Instruct.Q4_K_M.gguf).
+  static const String smolvlmTextGgufUrl =
+      'https://huggingface.co/mradermacher/SmolVLM-256M-Instruct-GGUF/resolve/main/SmolVLM-256M-Instruct.Q4_K_M.gguf';
+
+  // IndicTrans2: no pre-built public ONNX — must self-export from AI4Bharat.
+  static const String indicTrans2OnnxUrl = ''; // TODO: self-export or skip for MVP
+
+  // Silero VAD — opset 15 / IR version 9 build, compatible with the
+  // onnxruntime on Android (max supported IR version: 9).
+  // FIX: onnx-community model is opset 16 / IR version 10 → "Unsupported
+  // model IR version: 10, max supported IR version: 9" crash.
+  // The official silero repo ships silero_vad_16k_op15.onnx at opset 15,
+  // supports 16 kHz (which is all this app uses).
   static const String sileroVadOnnxUrl =
-      'https://huggingface.co/spaces/narrator-app/models/resolve/main/silero_vad.onnx';
+      'https://github.com/snakers4/silero-vad/raw/master/src/silero_vad/data/silero_vad_16k_op15.onnx';
+
+  // Whisper-tiny multilingual ONNX — split into encoder + merged decoder.
+  // FIX: there is no single model.onnx; must load two sessions separately.
+  static const String whisperTinyEncoderUrl =
+      'https://huggingface.co/onnx-community/whisper-tiny/resolve/main/onnx/encoder_model.onnx';
+  static const String whisperTinyDecoderUrl =
+      'https://huggingface.co/onnx-community/whisper-tiny/resolve/main/onnx/decoder_model_merged.onnx';
 
   // ── Model File Names ────────────────────────────────────
   static const String yolov8nParamFile = 'yolov8n.ncnn.param';
   static const String yolov8nBinFile = 'yolov8n.ncnn.bin';
-  static const String smolvlmFile = 'smolvlm_256m_q4.gguf';
+  // mmproj — vision projector (downloaded via smolvlmGgufUrl)
+  static const String smolvlmFile = 'mmproj-SmolVLM-256M-Instruct-f16.gguf';
+  // text GGUF — language model (downloaded via smolvlmTextGgufUrl)
+  static const String smolvlmTextFile = 'SmolVLM-256M-Instruct.Q4_K_M.gguf';
   static const String indicTrans2File = 'indictrans2_int8.onnx';
-  static const String whisperTinyFile = 'whisper_tiny_multilingual.onnx';
+  // Silero VAD saved locally under this name regardless of remote filename
   static const String sileroVadFile = 'silero_vad.onnx';
+  // Whisper split into two files
+  static const String whisperTinyEncoderFile = 'whisper_tiny_encoder.onnx';
+  static const String whisperTinyDecoderFile = 'whisper_tiny_decoder_merged.onnx';
   static const String qwen3VlFile = 'qwen3_vl_2b_q4.gguf';
 
-  // SHA-256 hashes for integrity verification
+  // SHA-256 hashes for integrity verification.
   static const Map<String, String> modelHashes = {
-    'silero_vad.onnx': 'placeholder_sha256_silero',
-    'whisper_tiny_multilingual.onnx': 'placeholder_sha256_whisper',
-    'indictrans2_int8.onnx': 'placeholder_sha256_indictrans2',
-    'smolvlm_256m_q4.gguf': 'placeholder_sha256_smolvlm',
-    'yolov8n.ncnn.param': 'placeholder_sha256_yolo_param',
-    'yolov8n.ncnn.bin': 'placeholder_sha256_yolo_bin',
+    // From HF xet metadata
+    'mmproj-SmolVLM-256M-Instruct-f16.gguf':
+        '0802360aca1748f112ea510b8ff277c65b1361c8ef30ed89b83c9c7a60d08e96',
+    'whisper_tiny_encoder.onnx':
+        'a048dcf0cde98db805f46be32b75d778cf824aad20b51a02e5b9cff457426238',
+    // Verify these after first successful download
+    'silero_vad.onnx':                    'verify_after_download',
+    'SmolVLM-256M-Instruct.Q4_K_M.gguf': 'verify_after_download',
+    'whisper_tiny_decoder_merged.onnx':   'verify_after_download',
+    'indictrans2_int8.onnx':              'verify_after_download',
+    'yolov8n.ncnn.param':                 'verify_after_download',
+    'yolov8n.ncnn.bin':                   'verify_after_download',
   };
 
   // ── Pipeline 1 Tuning ───────────────────────────────────

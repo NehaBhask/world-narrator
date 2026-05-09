@@ -21,9 +21,11 @@ class _SplashScreenState extends State<SplashScreen> {
     if (!mounted) return;
     if (!DpdpConsentManager.instance.hasConsented()) {
       Navigator.pushReplacementNamed(context, '/consent');
-    } else if (!ModelManager.instance.coreModelsReady) {
+    } else if (!ModelManager.instance.essentialModelsReady) {
+      // Show download screen to get at least Silero VAD + Whisper
       Navigator.pushReplacementNamed(context, '/download');
     } else {
+      // Can proceed with available models (Silero VAD minimum)
       Navigator.pushReplacementNamed(context, '/home');
     }
   }

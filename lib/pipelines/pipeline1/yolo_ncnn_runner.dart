@@ -1,7 +1,7 @@
-import 'dart:ffi';
 import 'dart:io';
 import 'dart:typed_data';
 import 'package:camera/camera.dart';
+import 'package:flutter/services.dart';
 import 'package:logger/logger.dart';
 import '../../core/model_manager.dart';
 import '../../core/constants.dart';
@@ -22,8 +22,6 @@ class YoloDetection {
   });
 
   double get area => (x2 - x1) * (y2 - y1);
-
-  // Centre of bbox — used for proximity heuristic
   double get centerX => (x1 + x2) / 2;
   double get centerY => (y1 + y2) / 2;
 
@@ -35,7 +33,7 @@ class YoloDetection {
 }
 
 /// Dart-side wrapper around the NCNN JNI bridge for YOLOv8-nano inference.
-/// Communicates with native code via MethodChannel on Android.
+/// Uses the real Flutter MethodChannel bound to NarratorPlugin.kt.
 class YoloNcnnRunner {
   YoloNcnnRunner._();
   static final YoloNcnnRunner instance = YoloNcnnRunner._();
@@ -44,15 +42,15 @@ class YoloNcnnRunner {
   bool _isLoaded = false;
   bool get isLoaded => _isLoaded;
 
-  // ── Platform Channel ──────────────────────────────────────────────────────
-  static const _channel = MethodChannelBridge._internal();
+  // Real Flutter MethodChannel — registered in NarratorPlugin.kt
+  static const _channel = MethodChannel('com.narrator/ncnn_plugin');
 
   Future<bool> loadModel() async {
     final paramPath = ModelManager.instance.modelPath(AppConstants.yolov8nParamFile);
     final binPath   = ModelManager.instance.modelPath(AppConstants.yolov8nBinFile);
 
     if (!File(paramPath).existsSync() || !File(binPath).existsSync()) {
-      _log.w('YOLOv8 model files not found');
+      _log.w('YOLOv8 model files not found — P1 running in UI-only mode');
       return false;
     }
 
@@ -64,6 +62,9 @@ class YoloNcnnRunner {
       _isLoaded = result ?? false;
       _log.i('YOLOv8 model loaded: $_isLoaded');
       return _isLoaded;
+    } on MissingPluginException {
+      _log.w('NarratorPlugin not registered — YOLO disabled (run on device)');
+      return false;
     } catch (e) {
       _log.e('Error loading YOLO model: $e');
       return false;
@@ -71,14 +72,12 @@ class YoloNcnnRunner {
   }
 
   /// Run inference on a [CameraImage] (YUV420 format).
-  /// Returns list of detections (obstacle classes only).
+  /// Returns empty list if model not loaded or plugin not available.
   Future<List<YoloDetection>> detect(CameraImage image) async {
     if (!_isLoaded) return [];
 
     try {
-      // Combine YUV planes into single byte array for JNI
-      final yuvBytes = _cameraImageToYuv(image);
-
+      final yuvBytes = _cameraImageToNv21(image);
       final rawResult = await _channel.invokeMethod<List<dynamic>>(
         'detectObjects',
         {
@@ -103,13 +102,16 @@ class YoloNcnnRunner {
         ));
       }
       return detections;
+    } on MissingPluginException {
+      return [];
     } catch (e) {
       _log.e('Inference error: $e');
       return [];
     }
   }
 
-  Uint8List _cameraImageToYuv(CameraImage image) {
+  /// Converts YUV420 CameraImage to NV21 byte array for JNI.
+  Uint8List _cameraImageToNv21(CameraImage image) {
     final yPlane = image.planes[0];
     final uPlane = image.planes[1];
     final vPlane = image.planes[2];
@@ -120,42 +122,18 @@ class YoloNcnnRunner {
     final Uint8List nv21 = Uint8List(ySize + uvSize * 2);
     nv21.setRange(0, ySize, yPlane.bytes);
 
-    // Interleave V and U for NV21
+    // Interleave V and U for NV21 format
     for (int i = 0; i < uvSize; i++) {
-      nv21[ySize + i * 2] = vPlane.bytes[i];
+      nv21[ySize + i * 2]     = vPlane.bytes[i];
       nv21[ySize + i * 2 + 1] = uPlane.bytes[i];
     }
     return nv21;
   }
 
   Future<void> release() async {
-    await _channel.invokeMethod('releaseYoloModel');
+    try {
+      await _channel.invokeMethod('releaseYoloModel');
+    } catch (_) {}
     _isLoaded = false;
-  }
-}
-
-/// Thin wrapper around MethodChannel to keep runner testable.
-class MethodChannelBridge {
-  const MethodChannelBridge._internal();
-
-  static const _platform =
-      _FlutterMethodChannel('com.narrator/ncnn_plugin');
-
-  Future<T?> invokeMethod<T>(String method, [dynamic arguments]) =>
-      _platform.invokeMethod<T>(method, arguments);
-}
-
-// ignore: non_constant_identifier_names
-_FlutterMethodChannel get _channel =>
-    const _FlutterMethodChannel('com.narrator/ncnn_plugin');
-
-// Lightweight adapter — avoids direct flutter/services import in this file
-class _FlutterMethodChannel {
-  final String name;
-  const _FlutterMethodChannel(this.name);
-  Future<T?> invokeMethod<T>(String method, [dynamic arguments]) async {
-    // Actual invocation delegated to platform channel in NarratorPlugin.kt
-    // This stub is replaced at runtime by Flutter's method channel binding.
-    throw UnimplementedError('MethodChannel not bound — see NarratorPlugin.kt');
   }
 }

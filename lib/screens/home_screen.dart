@@ -5,6 +5,8 @@ import 'package:flutter_animate/flutter_animate.dart';
 import 'package:gap/gap.dart';
 import 'package:permission_handler/permission_handler.dart';
 import '../main.dart';
+import '../core/constants.dart';
+import '../core/model_manager.dart';
 import '../pipelines/pipeline1/safety_coordinator.dart';
 import '../pipelines/pipeline1/yolo_ncnn_runner.dart';
 import '../pipelines/pipeline2/conversation_coordinator.dart';
@@ -36,6 +38,7 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
   StreamSubscription? _transcriptSub;
   StreamSubscription? _responseSub;
   StreamSubscription? _detectionSub;
+  int _frameIdx = 0;
 
   @override
   void initState() {
@@ -47,8 +50,19 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
   Future<void> _initApp() async {
     await _requestPermissions();
     if (!_permissionsGranted) return;
+
+    // Brief delay allows Android permission & hardware state to settle
+    await Future.delayed(const Duration(milliseconds: 300));
+    if (!mounted) return;
+
     await _initCamera();
-    await _initPipelines();
+
+    if (mounted) {
+      // Early init (VAD, P1) — no native VLM calls, safe alongside camera
+      await _initPipelinesEarly();
+      // Deferred init (VLM) — starts image stream only after all native inits
+      _initPipelinesDeferred();
+    }
   }
 
   Future<void> _requestPermissions() async {
@@ -63,43 +77,149 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
   }
 
   Future<void> _initCamera() async {
-    if (cameras.isEmpty) return;
-    final back = cameras.firstWhere(
-      (c) => c.lensDirection == CameraLensDirection.back,
-      orElse: () => cameras.first,
-    );
-    _cameraController = CameraController(
-      back,
-      ResolutionPreset.medium, // 720p — balance quality vs inference speed
-      enableAudio: false,
-      imageFormatGroup: ImageFormatGroup.yuv420,
-    );
-    try {
-      await _cameraController!.initialize();
-      setState(() => _cameraReady = true);
+    if (cameras.isEmpty) {
+      debugPrint('No cameras available');
+      return;
+    }
 
-      // Start image stream for dual pipeline
-      await _cameraController!.startImageStream((image) async {
-        _frameSelector.addFrame(image);
-        await SafetyCoordinator.instance.processFrame(image);
-      });
+    try {
+      final back = cameras.firstWhere(
+        (c) => c.lensDirection == CameraLensDirection.back,
+        orElse: () => cameras.first,
+      );
+
+      _cameraController = CameraController(
+        back,
+        ResolutionPreset.medium,
+        enableAudio: false,
+      );
+
+      await _cameraController!.initialize();
+
+      if (!mounted) {
+        await _cameraController?.dispose();
+        return;
+      }
+
+      setState(() => _cameraReady = true);
+      debugPrint('Camera initialized successfully');
+
+      // DO NOT start image stream here — VLM native init causes Camera2
+      // capture session conflict on Snapdragon 662 (CameraCaptureSession
+      // onClosed + black screen). Stream starts after all native inits.
+
     } catch (e) {
-      debugPrint('Camera init error: $e');
+      debugPrint('Camera initialization failed: $e');
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(content: Text('Camera error: $e')),
+        );
+      }
     }
   }
 
-  Future<void> _initPipelines() async {
-    // Pipeline 1
-    await SafetyCoordinator.instance.start();
+  /// Starts the camera image stream.
+  /// Called once, after ALL native pipeline inits are complete.
+  ///
+  /// Toggles _cameraReady off/on to force Flutter to rebuild CameraPreview
+  /// with the new Camera2 capture session texture — without this the preview
+  /// stays black after startImageStream reconfigures the session.
+  Future<void> _startImageStream() async {
+  if (_cameraController?.value.isInitialized != true) return;
+  if (_cameraController!.value.isStreamingImages) return;
 
-    // Pipeline 2
-    await SileroVad.instance.init();
-    await VlmRunner.instance.init();
-    await VlmRunner.instance.loadModel();
-    ConversationCoordinator.instance.attachFrameSelector(_frameSelector);
-    await ConversationCoordinator.instance.start();
+  if (mounted) setState(() => _cameraReady = false);
 
-    // Subscribe to P2 events
+  await _cameraController!.dispose();
+
+  final back = cameras.firstWhere(
+    (c) => c.lensDirection == CameraLensDirection.back,
+    orElse: () => cameras.first,
+  );
+
+  _cameraController = CameraController(
+    back,
+    ResolutionPreset.medium,
+    enableAudio: false,
+  );
+
+  await _cameraController!.initialize();
+  if (!mounted) return;
+
+  await _cameraController!.startImageStream((image) {
+    _frameIdx++;
+    _frameSelector.addFrame(image);
+  });
+
+  // Wait for Camera2 to finish session reconfiguration after startImageStream.
+  // The onClosed + onConfigured cycle takes ~300ms on Snapdragon 662.
+  // Setting _cameraReady before this completes gives Flutter a stale texture.
+  await Future.delayed(const Duration(milliseconds: 1000));
+  if (!mounted) return;
+
+  setState(() => _cameraReady = true);
+  // After setState(_cameraReady = true), add:
+  debugPrint('Camera preview live with image stream');
+}
+  /// Early pipeline initialization — lightweight, no native VLM calls.
+  Future<void> _initPipelinesEarly() async {
+    // Pipeline 1 (optional — obstacle detection via YOLO)
+    try {
+      if (ModelManager.instance.pipeline1Ready) {
+        await SafetyCoordinator.instance.start();
+      } else {
+        debugPrint('P1: YOLO models not available — safety pipeline disabled');
+      }
+    } catch (e) {
+      debugPrint('P1 init error (non-fatal): $e');
+    }
+
+    // Pipeline 2 — Silero VAD (ONNX, lightweight, no camera conflict)
+    try {
+      await SileroVad.instance.init();
+    } catch (e) {
+      debugPrint('Silero VAD init error (non-fatal): $e');
+    }
+  }
+
+  /// Deferred pipeline initialization.
+  /// Order: VLM (heaviest native) → coordinator → image stream → subscriptions.
+  /// Image stream MUST start after VLM to avoid Camera2 session conflict.
+  Future<void> _initPipelinesDeferred() async {
+    // Give camera preview time to fully stabilise before heavy native init
+    await Future.delayed(const Duration(seconds: 2));
+    if (!mounted) return;
+
+    // Pipeline 2 — VLM (llama.cpp native, heaviest init)
+    try {
+      if (ModelManager.instance.isReady(AppConstants.smolvlmFile)) {
+        await VlmRunner.instance.init();
+        await VlmRunner.instance.loadModel();
+        debugPrint('VLM loaded successfully');
+      } else {
+        debugPrint('VLM model not available — vision features disabled');
+      }
+    } catch (e) {
+      debugPrint('VLM init error (non-fatal): $e');
+    }
+
+    if (!mounted) return;
+
+    // Pipeline 2 — Conversation coordinator
+    try {
+      ConversationCoordinator.instance.attachFrameSelector(_frameSelector);
+      await ConversationCoordinator.instance.start();
+    } catch (e) {
+      debugPrint('Conversation coordinator init error (non-fatal): $e');
+    }
+
+    if (!mounted) return;
+
+    // Start image stream NOW — all native inits complete, no session conflict.
+    // Toggles _cameraReady to force CameraPreview texture rebuild.
+    _startImageStream();
+
+    // Subscribe to Pipeline 2 event streams
     _p2StateSub = ConversationCoordinator.instance.stateStream.listen((_) {
       if (mounted) setState(() {});
     });
@@ -123,21 +243,29 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
     }
   }
 
-  @override
-  void dispose() {
-    WidgetsBinding.instance.removeObserver(this);
-    _cameraController?.dispose();
-    _p2StateSub?.cancel();
-    _transcriptSub?.cancel();
-    _responseSub?.cancel();
-    _detectionSub?.cancel();
+ @override
+void dispose() {
+  WidgetsBinding.instance.removeObserver(this);
+  _cameraController?.dispose();
+  _p2StateSub?.cancel();
+  _transcriptSub?.cancel();
+  _responseSub?.cancel();
+  _detectionSub?.cancel();
+  // Only stop P1 if it was running — avoids _yolo.release() interfering
+  // with camera session on devices where YOLO never loaded
+  if (SafetyCoordinator.instance.state == Pipeline1State.running) {
     SafetyCoordinator.instance.stop();
-    ConversationCoordinator.instance.stop();
-    super.dispose();
   }
+  ConversationCoordinator.instance.stop();
+  super.dispose();
+}
 
   void _clearConversation() {
-    setState(() { _transcript = ''; _response = ''; _responseSentences.clear(); });
+    setState(() {
+      _transcript = '';
+      _response = '';
+      _responseSentences.clear();
+    });
   }
 
   @override
@@ -149,7 +277,7 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
       backgroundColor: Colors.black,
       body: Stack(
         children: [
-          // ── Full-bleed camera preview ─────────────────────────────────────
+          // ── Full-bleed camera preview ───────────────────────────────────
           if (_cameraReady && _cameraController != null)
             Positioned.fill(
               child: CameraPreview(_cameraController!),
@@ -162,51 +290,55 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
                   child: Column(mainAxisSize: MainAxisSize.min, children: [
                     const CircularProgressIndicator(color: Color(0xFF6C63FF)),
                     const Gap(16),
-                    Text(!_permissionsGranted
-                        ? 'Camera permission required'
-                        : 'Initialising camera...',
-                      style: const TextStyle(color: Colors.white54)),
+                    Text(
+                      !_permissionsGranted
+                          ? 'Camera permission required'
+                          : 'Initialising camera...',
+                      style: const TextStyle(color: Colors.white54),
+                    ),
                   ]),
                 ),
               ),
             ),
 
-          // ── Detection overlay bounding boxes ─────────────────────────────
-          if (_cameraReady)
+          // ── Detection overlay bounding boxes ───────────────────────────
+          // In build(), replace the StreamBuilder with:
+          if (_cameraReady &&
+              SafetyCoordinator.instance.state == Pipeline1State.running)
             StreamBuilder(
               stream: SafetyCoordinator.instance.detectionsStream,
               builder: (ctx, snap) => CameraOverlay(
                 detections: snap.data ?? [],
                 imageSize: _cameraController != null
-                    ? Size(_cameraController!.value.previewSize!.height,
-                        _cameraController!.value.previewSize!.width)
+                    ? Size(
+                        _cameraController!.value.previewSize!.height,
+                        _cameraController!.value.previewSize!.width,
+                      )
                     : Size.zero,
               ),
             ),
 
-          // ── Top bar: settings + FPS ───────────────────────────────────────
+          // ── Top bar ────────────────────────────────────────────────────
           Positioned(
             top: 0, left: 0, right: 0,
             child: SafeArea(
               child: Padding(
                 padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 8),
                 child: Row(children: [
-                  // App logo
                   Container(
                     padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 6),
                     decoration: BoxDecoration(
                       color: Colors.black54,
                       borderRadius: BorderRadius.circular(20),
                     ),
-                    child: Row(children: [
-                      const Icon(Icons.visibility, color: Color(0xFF6C63FF), size: 18),
-                      const Gap(6),
-                      const Text('Narrator', style: TextStyle(
+                    child: const Row(children: [
+                      Icon(Icons.visibility, color: Color(0xFF6C63FF), size: 18),
+                      Gap(6),
+                      Text('Narrator', style: TextStyle(
                         color: Colors.white, fontWeight: FontWeight.bold, fontSize: 15)),
                     ]),
                   ),
                   const Spacer(),
-                  // FPS badge
                   Container(
                     padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 5),
                     decoration: BoxDecoration(
@@ -215,15 +347,15 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
                     ),
                     child: Text(
                       '${SafetyCoordinator.instance.currentFps.toStringAsFixed(0)} FPS',
-                      style: const TextStyle(color: Colors.white54, fontSize: 12)),
+                      style: const TextStyle(color: Colors.white54, fontSize: 12),
+                    ),
                   ),
                   const Gap(8),
-                  // Settings
                   GestureDetector(
                     onTap: () => Navigator.pushNamed(context, '/settings'),
                     child: Container(
                       width: 40, height: 40,
-                      decoration: BoxDecoration(
+                      decoration: const BoxDecoration(
                         color: Colors.black54, shape: BoxShape.circle),
                       child: const Icon(Icons.settings_outlined, color: Colors.white, size: 20),
                     ),
@@ -233,7 +365,7 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
             ),
           ),
 
-          // ── Pipeline status badges ────────────────────────────────────────
+          // ── Pipeline status badges ─────────────────────────────────────
           Positioned(
             top: 80, left: 16, right: 16,
             child: Row(children: [
@@ -254,7 +386,7 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
             ]),
           ).animate().fadeIn(delay: 600.ms),
 
-          // ── Bottom panel: transcript + response ───────────────────────────
+          // ── Bottom panel ───────────────────────────────────────────────
           Positioned(
             bottom: 0, left: 0, right: 0,
             child: Container(
@@ -329,7 +461,10 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
                                   : p2State == Pipeline2State.speaking ? 'Speaking...'
                                   : 'Ask a Question',
                               style: const TextStyle(
-                                color: Colors.white, fontWeight: FontWeight.bold, fontSize: 16),
+                                color: Colors.white,
+                                fontWeight: FontWeight.bold,
+                                fontSize: 16,
+                              ),
                             ),
                           ]),
                         ),
@@ -342,8 +477,10 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
                         child: Container(
                           width: 50, height: 50,
                           decoration: BoxDecoration(
-                            color: Colors.white10, shape: BoxShape.circle,
-                            border: Border.all(color: Colors.white24)),
+                            color: Colors.white10,
+                            shape: BoxShape.circle,
+                            border: Border.all(color: Colors.white24),
+                          ),
                           child: const Icon(Icons.close, color: Colors.white54, size: 20),
                         ),
                       ),
@@ -355,8 +492,11 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
                     Padding(
                       padding: const EdgeInsets.only(top: 10),
                       child: Center(
-                        child: Text('Say "Suno" or "Hey Narrator" to start',
-                          style: TextStyle(color: Colors.white.withOpacity(0.35), fontSize: 12)),
+                        child: Text(
+                          'Say "Suno" or "Hey Narrator" to start',
+                          style: TextStyle(
+                            color: Colors.white.withOpacity(0.35), fontSize: 12),
+                        ),
                       ),
                     ).animate(onPlay: (c) => c.repeat())
                         .shimmer(duration: 2.seconds, color: Colors.white24),

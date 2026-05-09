@@ -80,9 +80,7 @@ class SafetyCoordinator {
       _detectionCount++;
       await _triggerAlert(threat);
     }
-
-    final elapsed = DateTime.now().difference(frameStart).inMilliseconds;
-    _log.d('P1 frame: ${elapsed}ms, dets=${detections.length}');
+    // Note: per-frame logging removed — it floods logcat at 30fps
   }
 
   Future<void> _triggerAlert(YoloDetection threat) async {
